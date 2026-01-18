@@ -4,7 +4,7 @@ import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Optional, Set
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 import aiohttp
@@ -25,128 +25,65 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @dataclass
-class ScrapedPage:
-    url: str
-    title: str
-    content: str
-    headings: List[str]
-    links: List[str]
-
-@dataclass
 class WebChunk:
-    id: str
     url: str
     title: str
     section: str
     content: str
-    keywords: List[str]
+    embedding: List[float] = None
 
 class WebKnowledgeBase:
     def __init__(self):
-        self.chunks = []
-        self.sources = {}
+        self.chunks: List[WebChunk] = []
         self.is_indexing = False
         self.index_progress = ""
         self.pages_count = 0
 
     def clear(self):
         self.chunks = []
-        self.sources = {}
         self.pages_count = 0
 
-    def _extract_keywords(self, text):
-        words = re.findall(r'\b[a-z]{3,}\b', text.lower())
-        stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'has', 'her', 'was', 'one', 'our', 'out', 'had', 'how', 'its', 'may', 'who', 'will', 'with', 'this', 'that', 'have', 'from', 'they', 'been', 'would', 'each', 'which', 'their', 'what', 'there', 'when', 'your', 'just', 'into'}
-        return list(set(w for w in words if w not in stop_words))
+    def add_chunk(self, chunk: WebChunk):
+        self.chunks.append(chunk)
 
-    def _split_into_sections(self, content):
-        sections = []
-        current_header = ""
-        current_content = []
-        for line in content.split('\n'):
-            if line.startswith('## '):
-                if current_content:
-                    sections.append((current_header, '\n'.join(current_content)))
-                current_header = line[3:].strip()
-                current_content = []
-            else:
-                current_content.append(line)
-        if current_content:
-            sections.append((current_header, '\n'.join(current_content)))
-        return sections
-
-    def add_page(self, page):
-        if len(page.content) < 50:
-            return
-        self.sources[page.url] = page.title
-        sections = self._split_into_sections(page.content)
-        for i, (section_title, section_content) in enumerate(sections):
-            if len(section_content.strip()) < 30:
-                continue
-            chunk = WebChunk(id=f"{hash(page.url)}_{i}", url=page.url, title=page.title, section=section_title or page.title, content=section_content.strip(), keywords=self._extract_keywords(section_title + " " + section_content))
-            self.chunks.append(chunk)
-
-    def search(self, query, top_k=8):
-        query_keywords = set(self._extract_keywords(query))
-        if not query_keywords:
+    def search(self, query_embedding: List[float], top_k: int = 6) -> List[WebChunk]:
+        if not self.chunks:
             return []
-        scored_chunks = []
+        scored = []
         for chunk in self.chunks:
-            chunk_keywords = set(chunk.keywords)
-            matches = query_keywords.intersection(chunk_keywords)
-            if matches:
-                section_keywords = set(self._extract_keywords(chunk.section))
-                section_matches = query_keywords.intersection(section_keywords)
-                score = len(matches) + (len(section_matches) * 2)
-                scored_chunks.append((score, chunk))
-        scored_chunks.sort(key=lambda x: x[0], reverse=True)
-        return [chunk for score, chunk in scored_chunks[:top_k]]
-
-    def get_context_with_sources(self, query, max_tokens=10000):
-        chunks = self.search(query, top_k=10)
-        if not chunks:
-            return "No relevant documentation found.", []
-        context_parts = []
-        sources = []
-        seen_urls = set()
-        estimated_tokens = 0
-        for chunk in chunks:
-            chunk_text = f"### {chunk.section}\n\n{chunk.content}\n\n"
-            chunk_tokens = len(chunk_text) // 4
-            if estimated_tokens + chunk_tokens > max_tokens:
-                break
-            context_parts.append(chunk_text)
-            estimated_tokens += chunk_tokens
-            if chunk.url not in seen_urls:
-                seen_urls.add(chunk.url)
-                sources.append({'url': chunk.url, 'title': chunk.title, 'section': chunk.section})
-        return '\n'.join(context_parts), sources
+            if chunk.embedding:
+                score = sum(a * b for a, b in zip(query_embedding, chunk.embedding))
+                scored.append((score, chunk))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [chunk for _, chunk in scored[:top_k]]
 
 kb = WebKnowledgeBase()
 
+def get_embedding(text: str) -> List[float]:
+    text = text[:8000]
+    response = openai_client.embeddings.create(input=text, model="text-embedding-3-small")
+    return response.data[0].embedding
+
 class DocsScraper:
-    def __init__(self, base_url, max_pages=200):
+    def __init__(self, base_url: str, max_pages: int = 300):
         self.base_url = base_url.rstrip('/')
         self.domain = urlparse(base_url).netloc
         self.max_pages = max_pages
-        self.visited = set()
+        self.visited: Set[str] = set()
         self.pages = []
 
-    def normalize_url(self, url):
+    def normalize_url(self, url: str) -> str:
         url = url.split('#')[0].rstrip('/')
         if not url.startswith('http'):
             url = urljoin(self.base_url, url)
         return url
 
-    def is_valid_url(self, url):
+    def is_valid_url(self, url: str) -> bool:
         parsed = urlparse(url)
         if parsed.netloc != self.domain:
             return False
         skip = ['/assets/', '/static/', '/images/', '/_next/', '.png', '.jpg', '.gif', '.svg', '.css', '.js', '.json']
-        for p in skip:
-            if p in url.lower():
-                return False
-        return True
+        return not any(p in url.lower() for p in skip)
 
     async def scrape_page(self, session, url):
         url = self.normalize_url(url)
@@ -154,12 +91,10 @@ class DocsScraper:
             return None
         self.visited.add(url)
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
-                if response.status != 200:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200 or 'text/html' not in resp.headers.get('content-type', ''):
                     return None
-                if 'text/html' not in response.headers.get('content-type', ''):
-                    return None
-                html = await response.text()
+                html = await resp.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
                     tag.decompose()
@@ -169,36 +104,20 @@ class DocsScraper:
                     title = h1.get_text(strip=True)
                 elif soup.title:
                     title = soup.title.string or ""
-                main = soup.find('main') or soup.find('article') or soup.find(class_=re.compile(r'(content|docs|article)', re.I)) or soup.body
-                content_parts = []
-                headings = []
-                if main:
-                    for el in main.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'code', 'td', 'th']):
-                        text = el.get_text(strip=True)
-                        if text and len(text) > 5:
-                            if el.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                                text = f"\n## {text}\n"
-                                headings.append(text)
-                            elif el.name == 'li':
-                                text = f"* {text}"
-                            elif el.name in ['pre', 'code']:
-                                text = f"```\n{text}\n```"
-                            content_parts.append(text)
-                content = '\n'.join(content_parts)
-                content = re.sub(r'\n{3,}', '\n\n', content).strip()
+                main = soup.find('main') or soup.find('article') or soup.body
+                content = main.get_text(separator='\n', strip=True) if main else ""
                 links = []
                 for a in soup.find_all('a', href=True):
                     href = self.normalize_url(a['href'])
                     if self.is_valid_url(href):
                         links.append(href)
-                if len(content) > 50:
-                    return ScrapedPage(url=url, title=title, content=content, headings=headings, links=list(set(links)))
-        except Exception as e:
-            print(f"Error scraping {url}: {e}")
+                if len(content) > 100:
+                    return {'url': url, 'title': title, 'content': content, 'links': list(set(links))}
+        except:
+            pass
         return None
 
     async def crawl(self):
-        print(f"Starting crawl of {self.base_url}")
         to_visit = [self.base_url]
         async with aiohttp.ClientSession(headers={'User-Agent': 'Mozilla/5.0'}) as session:
             while to_visit and len(self.pages) < self.max_pages:
@@ -209,78 +128,102 @@ class DocsScraper:
                 page = await self.scrape_page(session, url)
                 if page:
                     self.pages.append(page)
-                    for link in page.links:
+                    for link in page['links']:
                         if link not in self.visited and link not in to_visit:
                             to_visit.append(link)
-                await asyncio.sleep(0.2)
-        print(f"Crawl complete: {len(self.pages)} pages")
+                await asyncio.sleep(0.15)
         return self.pages
 
-async def index_documentation(url, max_pages=200):
+def chunk_text(text: str, max_len: int = 800) -> List[str]:
+    paragraphs = text.split('\n\n')
+    chunks = []
+    current = ""
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        if len(current) + len(p) < max_len:
+            current += p + "\n\n"
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = p + "\n\n"
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+async def index_documentation(url: str, max_pages: int = 300):
     kb.is_indexing = True
     kb.clear()
     try:
         scraper = DocsScraper(url, max_pages)
         pages = await scraper.crawl()
-        for page in pages:
-            kb.add_page(page)
         kb.pages_count = len(pages)
+        total_chunks = sum(len(chunk_text(p['content'])) for p in pages)
+        done = 0
+        for page in pages:
+            chunks = chunk_text(page['content'])
+            for i, chunk_content in enumerate(chunks):
+                done += 1
+                kb.index_progress = f"Embedding {done}/{total_chunks}"
+                try:
+                    embedding = get_embedding(chunk_content)
+                    chunk = WebChunk(url=page['url'], title=page['title'], section=f"Part {i+1}", content=chunk_content, embedding=embedding)
+                    kb.add_chunk(chunk)
+                except:
+                    pass
+                await asyncio.sleep(0.05)
         kb.index_progress = f"Done! {len(pages)} pages, {len(kb.chunks)} chunks"
     finally:
         kb.is_indexing = False
 
-SYSTEM_PROMPT = """You are Rork Support, a friendly and helpful support agent for Rork - a mobile app development platform that lets anyone build apps using AI.
+SYSTEM_PROMPT = """You are Rork Support, a friendly helpful assistant for Rork - an AI-powered mobile app builder.
 
-Your personality:
-- Warm, friendly, and conversational
-- Use casual language and be encouraging
-- Keep responses concise but complete
-- If you dont know something, be honest
+Be conversational and helpful. Use simple language. Give clear step-by-step instructions when needed.
 
-Guidelines:
-- Answer based on the documentation provided below
-- Give step-by-step instructions when helpful
-- If the docs dont cover something, suggest contacting support
-- Sound like a real person, not a robot
+If the documentation doesnt cover something, say youre not sure and suggest they contact support.
 
 DOCUMENTATION:
-{context}
+{context}"""
 
-Remember: Be helpful, friendly, and human!"""
-
-async def answer_question(question):
+async def answer_question(question: str) -> dict:
     if not kb.chunks:
-        return {"answer": "Hey! Im still loading up the docs - give me a minute and try again!", "sources": []}
-    context, sources = kb.get_context_with_sources(question, max_tokens=8000)
-    if not sources:
-        return {"answer": "Hmm, I couldnt find anything specific about that in the docs. Could you try rephrasing or let me know more details?", "sources": []}
+        return {"answer": "Still loading docs - try again in a minute!", "sources": []}
     try:
-        response = openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}, {"role": "user", "content": question}], max_tokens=1000, temperature=0.7)
-        return {"answer": response.choices[0].message.content, "sources": sources[:3]}
+        query_emb = get_embedding(question)
+        results = kb.search(query_emb, top_k=6)
+        if not results:
+            return {"answer": "I couldnt find info about that. Try rephrasing or contact support!", "sources": []}
+        context = "\n\n---\n\n".join([f"**{c.title}**\n{c.content}" for c in results])
+        sources = list({c.url: c for c in results}.values())[:3]
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
+                {"role": "user", "content": question}
+            ],
+            max_tokens=1000,
+            temperature=0.7
+        )
+        return {"answer": response.choices[0].message.content, "sources": [{"url": s.url, "title": s.title} for s in sources]}
     except Exception as e:
-        return {"answer": "Oops, something went wrong! Try again in a sec.", "sources": []}
+        return {"answer": "Something went wrong - try again!", "sources": []}
 
-def format_response(result):
-    answer = result.get("answer", "No answer found.")
-    if len(answer) > 4000:
-        answer = answer[:3997] + "..."
+def format_response(result: dict) -> discord.Embed:
+    answer = result.get("answer", "")[:4000]
     embed = discord.Embed(description=answer, color=discord.Color.blue())
     sources = result.get("sources", [])
     if sources:
-        source_text = "\n".join([f"[{s['title']}]({s['url']})" for s in sources])
-        embed.add_field(name="Learn more:", value=source_text[:1000], inline=False)
+        txt = "\n".join([f"[{s['title']}]({s['url']})" for s in sources])
+        embed.add_field(name="Sources", value=txt[:1000], inline=False)
     return embed
 
 @bot.event
 async def on_ready():
-    print(f"{bot.user} is online!")
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands")
-    except Exception as e:
-        print(f"Failed to sync: {e}")
+    print(f"{bot.user} online!")
+    await bot.tree.sync()
     if not kb.chunks and DOCS_URL:
-        asyncio.create_task(index_documentation(DOCS_URL, max_pages=200))
+        asyncio.create_task(index_documentation(DOCS_URL, 300))
 
 @bot.event
 async def on_message(message):
@@ -288,40 +231,35 @@ async def on_message(message):
         return
     await bot.process_commands(message)
     if bot.user.mentioned_in(message) and not message.mention_everyone:
-        question = message.content.replace(f"<@{bot.user.id}>", "").strip()
-        if question:
+        q = message.content.replace(f"<@{bot.user.id}>", "").strip()
+        if q:
             async with message.channel.typing():
-                result = await answer_question(question)
-                embed = format_response(result)
-                await message.reply(embed=embed)
+                result = await answer_question(q)
+                await message.reply(embed=format_response(result))
 
 @bot.tree.command(name="ask", description="Ask about Rork")
 @app_commands.describe(question="Your question")
-async def ask_command(interaction: discord.Interaction, question: str):
+async def ask_cmd(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     result = await answer_question(question)
     await interaction.followup.send(embed=format_response(result))
 
 @bot.tree.command(name="index", description="Re-index docs")
 @app_commands.default_permissions(administrator=True)
-async def index_command(interaction: discord.Interaction, url: str = None, max_pages: int = 200):
+async def index_cmd(interaction: discord.Interaction, url: str = None, max_pages: int = 300):
     if kb.is_indexing:
-        await interaction.response.send_message(f"Already indexing: {kb.index_progress}")
+        await interaction.response.send_message(f"Indexing: {kb.index_progress}")
         return
     await interaction.response.send_message(f"Indexing {url or DOCS_URL}...")
     asyncio.create_task(index_documentation(url or DOCS_URL, max_pages))
 
 @bot.tree.command(name="status", description="Bot status")
-async def status_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="Status", color=discord.Color.green())
-    embed.add_field(name="Status", value="Indexing..." if kb.is_indexing else "Ready", inline=False)
-    embed.add_field(name="Pages", value=str(kb.pages_count), inline=True)
-    embed.add_field(name="Chunks", value=str(len(kb.chunks)), inline=True)
-    await interaction.response.send_message(embed=embed)
+async def status_cmd(interaction: discord.Interaction):
+    e = discord.Embed(title="Status", color=discord.Color.green())
+    e.add_field(name="Status", value="Indexing..." if kb.is_indexing else "Ready")
+    e.add_field(name="Pages", value=str(kb.pages_count))
+    e.add_field(name="Chunks", value=str(len(kb.chunks)))
+    await interaction.response.send_message(embed=e)
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN or not OPENAI_API_KEY:
-        print("Missing DISCORD_TOKEN or OPENAI_API_KEY")
-        exit(1)
     bot.run(DISCORD_TOKEN)
-
