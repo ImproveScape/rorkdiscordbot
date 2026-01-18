@@ -125,7 +125,7 @@ class WebKnowledgeBase:
 kb = WebKnowledgeBase()
 
 class DocsScraper:
-    def __init__(self, base_url, max_pages=100):
+    def __init__(self, base_url, max_pages=200):
         self.base_url = base_url.rstrip('/')
         self.domain = urlparse(base_url).netloc
         self.max_pages = max_pages
@@ -142,7 +142,7 @@ class DocsScraper:
         parsed = urlparse(url)
         if parsed.netloc != self.domain:
             return False
-        skip = ['/api/', '/assets/', '/static/', '/images/', '/_next/', '.png', '.jpg', '.gif', '.svg', '.css', '.js', '.json', '/changelog', '/blog', '/pricing', '/login', '/signup']
+        skip = ['/assets/', '/static/', '/images/', '/_next/', '.png', '.jpg', '.gif', '.svg', '.css', '.js', '.json']
         for p in skip:
             if p in url.lower():
                 return False
@@ -154,7 +154,7 @@ class DocsScraper:
             return None
         self.visited.add(url)
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
                 if response.status != 200:
                     return None
                 if 'text/html' not in response.headers.get('content-type', ''):
@@ -172,17 +172,18 @@ class DocsScraper:
                 main = soup.find('main') or soup.find('article') or soup.find(class_=re.compile(r'(content|docs|article)', re.I)) or soup.body
                 content_parts = []
                 headings = []
-                for el in main.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li', 'pre', 'code']):
-                    text = el.get_text(strip=True)
-                    if text and len(text) > 10:
-                        if el.name in ['h1', 'h2', 'h3', 'h4']:
-                            text = f"\n## {text}\n"
-                            headings.append(text)
-                        elif el.name == 'li':
-                            text = f"* {text}"
-                        elif el.name in ['pre', 'code']:
-                            text = f"```\n{text}\n```"
-                        content_parts.append(text)
+                if main:
+                    for el in main.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'code', 'td', 'th']):
+                        text = el.get_text(strip=True)
+                        if text and len(text) > 5:
+                            if el.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                                text = f"\n## {text}\n"
+                                headings.append(text)
+                            elif el.name == 'li':
+                                text = f"* {text}"
+                            elif el.name in ['pre', 'code']:
+                                text = f"```\n{text}\n```"
+                            content_parts.append(text)
                 content = '\n'.join(content_parts)
                 content = re.sub(r'\n{3,}', '\n\n', content).strip()
                 links = []
@@ -190,7 +191,7 @@ class DocsScraper:
                     href = self.normalize_url(a['href'])
                     if self.is_valid_url(href):
                         links.append(href)
-                if len(content) > 100:
+                if len(content) > 50:
                     return ScrapedPage(url=url, title=title, content=content, headings=headings, links=list(set(links)))
         except Exception as e:
             print(f"Error scraping {url}: {e}")
@@ -199,7 +200,7 @@ class DocsScraper:
     async def crawl(self):
         print(f"Starting crawl of {self.base_url}")
         to_visit = [self.base_url]
-        async with aiohttp.ClientSession(headers={'User-Agent': 'RorkDocsBot/1.0'}) as session:
+        async with aiohttp.ClientSession(headers={'User-Agent': 'Mozilla/5.0'}) as session:
             while to_visit and len(self.pages) < self.max_pages:
                 url = to_visit.pop(0)
                 if url in self.visited:
@@ -211,11 +212,11 @@ class DocsScraper:
                     for link in page.links:
                         if link not in self.visited and link not in to_visit:
                             to_visit.append(link)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
         print(f"Crawl complete: {len(self.pages)} pages")
         return self.pages
 
-async def index_documentation(url, max_pages=100):
+async def index_documentation(url, max_pages=200):
     kb.is_indexing = True
     kb.clear()
     try:
@@ -228,39 +229,46 @@ async def index_documentation(url, max_pages=100):
     finally:
         kb.is_indexing = False
 
-SYSTEM_PROMPT = """You are a helpful documentation assistant for Rork, a mobile app development platform.
-RULES:
-1. Only use information from the DOCUMENTATION section below
-2. If something is not covered, say I do not have information about that
-3. Be concise but thorough
-4. Format for Discord: use **bold**, code, bullet points
+SYSTEM_PROMPT = """You are Rork Support, a friendly and helpful support agent for Rork - a mobile app development platform that lets anyone build apps using AI.
+
+Your personality:
+- Warm, friendly, and conversational
+- Use casual language and be encouraging
+- Keep responses concise but complete
+- If you dont know something, be honest
+
+Guidelines:
+- Answer based on the documentation provided below
+- Give step-by-step instructions when helpful
+- If the docs dont cover something, suggest contacting support
+- Sound like a real person, not a robot
 
 DOCUMENTATION:
 {context}
 
-Answer the users question based on the documentation above."""
+Remember: Be helpful, friendly, and human!"""
 
 async def answer_question(question):
     if not kb.chunks:
-        return {"answer": "I have not indexed any documentation yet. Use /index first.", "sources": []}
+        return {"answer": "Hey! Im still loading up the docs - give me a minute and try again!", "sources": []}
     context, sources = kb.get_context_with_sources(question, max_tokens=8000)
     if not sources:
-        return {"answer": "I could not find relevant information.", "sources": []}
+        return {"answer": "Hmm, I couldnt find anything specific about that in the docs. Could you try rephrasing or let me know more details?", "sources": []}
     try:
-        response = openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}, {"role": "user", "content": question}], max_tokens=1000, temperature=0.3)
+        response = openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}, {"role": "user", "content": question}], max_tokens=1000, temperature=0.7)
         return {"answer": response.choices[0].message.content, "sources": sources[:3]}
     except Exception as e:
-        return {"answer": f"Error: {e}", "sources": []}
+        return {"answer": "Oops, something went wrong! Try again in a sec.", "sources": []}
 
 def format_response(result):
     answer = result.get("answer", "No answer found.")
     if len(answer) > 4000:
         answer = answer[:3997] + "..."
-    embed = discord.Embed(title="Rork Documentation", description=answer, color=discord.Color.blue())
+    embed = discord.Embed(description=answer, color=discord.Color.blue())
     sources = result.get("sources", [])
     if sources:
-        source_text = "\n".join([f"* [{s['title']}]({s['url']})" for s in sources])
-        embed.add_field(name="Sources", value=source_text[:1000], inline=False)
+        source_text = "\n".join([f"[{s['title']}]({s['url']})" for s in sources])
+        embed.add_field(name="Learn more:", value=source_text[:1000], inline=False)
     return embed
 
 @bot.event
@@ -272,7 +280,7 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync: {e}")
     if not kb.chunks and DOCS_URL:
-        asyncio.create_task(index_documentation(DOCS_URL, max_pages=100))
+        asyncio.create_task(index_documentation(DOCS_URL, max_pages=200))
 
 @bot.event
 async def on_message(message):
@@ -287,16 +295,16 @@ async def on_message(message):
                 embed = format_response(result)
                 await message.reply(embed=embed)
 
-@bot.tree.command(name="ask", description="Ask about Rork docs")
+@bot.tree.command(name="ask", description="Ask about Rork")
 @app_commands.describe(question="Your question")
 async def ask_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     result = await answer_question(question)
     await interaction.followup.send(embed=format_response(result))
 
-@bot.tree.command(name="index", description="Re-index docs (admin)")
+@bot.tree.command(name="index", description="Re-index docs")
 @app_commands.default_permissions(administrator=True)
-async def index_command(interaction: discord.Interaction, url: str = None, max_pages: int = 100):
+async def index_command(interaction: discord.Interaction, url: str = None, max_pages: int = 200):
     if kb.is_indexing:
         await interaction.response.send_message(f"Already indexing: {kb.index_progress}")
         return
@@ -316,3 +324,4 @@ if __name__ == "__main__":
         print("Missing DISCORD_TOKEN or OPENAI_API_KEY")
         exit(1)
     bot.run(DISCORD_TOKEN)
+
