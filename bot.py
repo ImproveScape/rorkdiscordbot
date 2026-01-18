@@ -1,10 +1,11 @@
 import os
 import re
 import asyncio
+import base64
 import discord
 from discord import app_commands
 from discord.ext import commands
-from typing import List, Dict, Optional, Set
+from typing import List, Optional, Set
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 import aiohttp
@@ -64,6 +65,30 @@ def get_embedding(text: str) -> List[float]:
     response = openai_client.embeddings.create(input=text, model="text-embedding-3-small")
     return response.data[0].embedding
 
+async def analyze_image(image_url: str = None, image_base64: str = None) -> str:
+    try:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image in detail. If it shows an error, code, or UI, explain what you see. Be specific."},
+                ]
+            }
+        ]
+        if image_url:
+            messages[0]["content"].append({"type": "image_url", "image_url": {"url": image_url}})
+        elif image_base64:
+            messages[0]["content"].append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}})
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Could not analyze image: {str(e)}"
+
 class DocsScraper:
     def __init__(self, base_url: str, max_pages: int = 300):
         self.base_url = base_url.rstrip('/')
@@ -82,8 +107,17 @@ class DocsScraper:
         parsed = urlparse(url)
         if parsed.netloc != self.domain:
             return False
-        skip = ['/assets/', '/static/', '/images/', '/_next/', '.png', '.jpg', '.gif', '.svg', '.css', '.js', '.json']
+        skip = ['/assets/', '/static/', '/_next/', '.css', '.js', '.json']
         return not any(p in url.lower() for p in skip)
+
+    def is_image_url(self, url: str) -> bool:
+        return any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp'])
+
+    async def get_image_description(self, session, url: str) -> str:
+        try:
+            return await analyze_image(image_url=url)
+        except:
+            return ""
 
     async def scrape_page(self, session, url):
         url = self.normalize_url(url)
@@ -106,6 +140,24 @@ class DocsScraper:
                     title = soup.title.string or ""
                 main = soup.find('main') or soup.find('article') or soup.body
                 content = main.get_text(separator='\n', strip=True) if main else ""
+                
+                # Get images and analyze them
+                images = []
+                for img in soup.find_all('img', src=True):
+                    img_url = urljoin(url, img['src'])
+                    if self.is_image_url(img_url):
+                        images.append(img_url)
+                
+                # Analyze up to 3 images per page
+                image_descriptions = []
+                for img_url in images[:3]:
+                    desc = await self.get_image_description(session, img_url)
+                    if desc:
+                        image_descriptions.append(f"[Image: {desc}]")
+                
+                if image_descriptions:
+                    content += "\n\n" + "\n".join(image_descriptions)
+                
                 links = []
                 for a in soup.find_all('a', href=True):
                     href = self.normalize_url(a['href'])
@@ -181,16 +233,25 @@ SYSTEM_PROMPT = """You are Rork Support, a friendly helpful assistant for Rork -
 
 Be conversational and helpful. Use simple language. Give clear step-by-step instructions when needed.
 
+If the user shared an image, I analyzed it for you. Use that info to help them.
+
 If the documentation doesnt cover something, say youre not sure and suggest they contact support.
 
 DOCUMENTATION:
-{context}"""
+{context}
 
-async def answer_question(question: str) -> dict:
+IMAGE ANALYSIS (if any):
+{image_info}"""
+
+async def answer_question(question: str, image_info: str = "") -> dict:
     if not kb.chunks:
         return {"answer": "Still loading docs - try again in a minute!", "sources": []}
     try:
-        query_emb = get_embedding(question)
+        search_text = question
+        if image_info:
+            search_text += " " + image_info
+        
+        query_emb = get_embedding(search_text)
         results = kb.search(query_emb, top_k=6)
         if not results:
             return {"answer": "I couldnt find info about that. Try rephrasing or contact support!", "sources": []}
@@ -199,7 +260,7 @@ async def answer_question(question: str) -> dict:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
+                {"role": "system", "content": SYSTEM_PROMPT.format(context=context, image_info=image_info or "None")},
                 {"role": "user", "content": question}
             ],
             max_tokens=1000,
@@ -232,16 +293,33 @@ async def on_message(message):
     await bot.process_commands(message)
     if bot.user.mentioned_in(message) and not message.mention_everyone:
         q = message.content.replace(f"<@{bot.user.id}>", "").strip()
-        if q:
+        
+        # Check for image attachments
+        image_info = ""
+        if message.attachments:
+            for att in message.attachments:
+                if att.content_type and att.content_type.startswith('image/'):
+                    async with message.channel.typing():
+                        image_info = await analyze_image(image_url=att.url)
+                    break
+        
+        if q or image_info:
             async with message.channel.typing():
-                result = await answer_question(q)
+                if not q and image_info:
+                    q = "What is this and how can you help me with it?"
+                result = await answer_question(q, image_info)
                 await message.reply(embed=format_response(result))
 
 @bot.tree.command(name="ask", description="Ask about Rork")
-@app_commands.describe(question="Your question")
-async def ask_cmd(interaction: discord.Interaction, question: str):
+@app_commands.describe(question="Your question", image="Upload a screenshot (optional)")
+async def ask_cmd(interaction: discord.Interaction, question: str, image: discord.Attachment = None):
     await interaction.response.defer(thinking=True)
-    result = await answer_question(question)
+    
+    image_info = ""
+    if image and image.content_type and image.content_type.startswith('image/'):
+        image_info = await analyze_image(image_url=image.url)
+    
+    result = await answer_question(question, image_info)
     await interaction.followup.send(embed=format_response(result))
 
 @bot.tree.command(name="index", description="Re-index docs")
@@ -263,3 +341,4 @@ async def status_cmd(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+
